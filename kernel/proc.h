@@ -1,3 +1,5 @@
+#include "sched.h"
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -101,4 +103,17 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  // Scheduler policy state and tick-based accounting.
+  int priority;                // Lower number means higher priority.
+  int mlfq_level;
+  uint quantum_used;
+  uint aging_wait;
+  uint run_time;
+  uint wait_time;
+  uint context_switches;
+  uint creation_time;
+  uint first_run_time;
+  uint completion_time;
+  int started;
 };

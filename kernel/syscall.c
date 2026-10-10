@@ -7,6 +7,13 @@
 #include "syscall.h"
 #include "defs.h"
 
+extern uint64 sys_get_sched_stats(void);
+extern uint64 sys_sched_set_policy(void);
+extern uint64 sys_sched_set_priority(void);
+extern uint64 sys_get_sched_policy(void);
+extern uint64 sys_sched_set_process_priority(void);
+extern uint64 sys_get_sched_procs(void);
+
 // Fetch the uint64 at addr from the current process.
 int
 fetchaddr(uint64 addr, uint64 *ip)
@@ -130,6 +137,12 @@ static uint64 (*syscalls[])(void) = {
   [SYS_mkdir]   = sys_mkdir,
   [SYS_close]   = sys_close,
   [SYS_sync]    = sys_sync,
+  [SYS_get_sched_stats] = sys_get_sched_stats,
+  [SYS_sched_set_policy] = sys_sched_set_policy,
+  [SYS_sched_set_priority] = sys_sched_set_priority,
+  [SYS_get_sched_policy] = sys_get_sched_policy,
+  [SYS_sched_set_process_priority] = sys_sched_set_process_priority,
+  [SYS_get_sched_procs] = sys_get_sched_procs,
   // clang-format on
 };
 

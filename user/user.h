@@ -1,5 +1,7 @@
 #define SBRK_ERROR ((char *)-1)
 
+#include "kernel/sched.h"
+
 struct stat;
 
 // system calls
@@ -25,6 +27,12 @@ char *sys_sbrk(int, int);
 int pause(int);
 int uptime(void);
 int sync(void);
+int get_sched_stats(int, struct sched_stats *);
+int sched_set_policy(int);
+int sched_set_priority(int);
+int get_sched_policy(void);
+int sched_set_process_priority(int, int);
+int get_sched_procs(struct sched_proc_info *, int);
 
 // ulib.c
 int stat(const char *, struct stat *);

@@ -21,3 +21,9 @@
 #define SYS_mkdir  20
 #define SYS_close  21
 #define SYS_sync   22
+#define SYS_get_sched_stats 23
+#define SYS_sched_set_policy 24
+#define SYS_sched_set_priority 25
+#define SYS_get_sched_policy 26
+#define SYS_sched_set_process_priority 27
+#define SYS_get_sched_procs 28

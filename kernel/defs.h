@@ -103,6 +103,13 @@ void            yield(void);
 int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
 int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
 void            procdump(void);
+int             kset_sched_policy(int);
+int             kget_sched_policy(void);
+int             kset_priority(int);
+int             kset_process_priority(int, int);
+int             sched_on_tick(struct proc*);
+void            sched_on_wakeup(struct proc*);
+void            sched_clock_tick(uint);
 
 // swtch.S
 void            swtch(struct context*, struct context*);

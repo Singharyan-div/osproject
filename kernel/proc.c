@@ -26,6 +26,292 @@ extern char trampoline[]; // trampoline.S
 // must be acquired before any p->lock.
 struct spinlock wait_lock;
 
+#define RR_QUANTUM 4
+#define PRIORITY_QUANTUM 4
+#define PRIORITY_AGING_INTERVAL 2
+#define MLFQ_LEVELS 3
+#define MLFQ_BOOST_INTERVAL 50
+
+static const uint mlfq_quantum[MLFQ_LEVELS] = {2, 4, 8};
+static uint last_mlfq_boost;
+static int pick_cursor = NPROC - 1;
+
+struct scheduler_policy {
+  struct proc *(*pick_next)(void);
+  int (*on_tick)(struct proc *);
+  void (*on_wakeup)(struct proc *);
+};
+
+static struct proc *rr_pick_next(void);
+static struct proc *priority_pick_next(void);
+static struct proc *mlfq_pick_next(void);
+static int rr_on_tick(struct proc *);
+static int priority_on_tick(struct proc *);
+static int mlfq_on_tick(struct proc *);
+static void common_on_wakeup(struct proc *);
+
+static struct scheduler_policy rr_policy = {
+  rr_pick_next, rr_on_tick, common_on_wakeup
+};
+static struct scheduler_policy priority_policy = {
+  priority_pick_next, priority_on_tick, common_on_wakeup
+};
+static struct scheduler_policy mlfq_policy = {
+  mlfq_pick_next, mlfq_on_tick, common_on_wakeup
+};
+static struct scheduler_policy *active_policy = &rr_policy;
+
+static int
+effective_priority(struct proc *p)
+{
+  int priority = p->priority - p->aging_wait / PRIORITY_AGING_INTERVAL;
+  return priority < 0 ? 0 : priority;
+}
+
+static struct proc *
+pick_by_policy(int policy)
+{
+  struct proc *p;
+  struct proc *best = 0;
+  int best_score = 0x7fffffff;
+  int best_index = -1;
+  int start = (pick_cursor + 1) % NPROC;
+
+  for (int offset = 0; offset < NPROC; offset++) {
+    int index = (start + offset) % NPROC;
+    p = &proc[index];
+    acquire(&p->lock);
+    if (p->state == RUNNABLE) {
+      int score = 0;
+      if (policy == SCHED_PRIORITY)
+        score = effective_priority(p);
+      else if (policy == SCHED_MLFQ)
+        score = p->mlfq_level;
+      if (score < best_score) {
+        best = p;
+        best_score = score;
+        best_index = index;
+      }
+    }
+    release(&p->lock);
+  }
+
+  if (best_index >= 0)
+    pick_cursor = best_index;
+  return best;
+}
+
+static struct proc *
+rr_pick_next(void)
+{
+  return pick_by_policy(SCHED_RR);
+}
+
+static struct proc *
+priority_pick_next(void)
+{
+  return pick_by_policy(SCHED_PRIORITY);
+}
+
+static struct proc *
+mlfq_pick_next(void)
+{
+  return pick_by_policy(SCHED_MLFQ);
+}
+
+static int
+rr_on_tick(struct proc *p)
+{
+  int expired;
+  acquire(&p->lock);
+  expired = ++p->quantum_used >= RR_QUANTUM;
+  if (expired)
+    p->quantum_used = 0;
+  release(&p->lock);
+  return expired;
+}
+
+static int
+priority_on_tick(struct proc *p)
+{
+  int expired;
+  int current_priority;
+  struct proc *other;
+
+  acquire(&p->lock);
+  expired = ++p->quantum_used >= PRIORITY_QUANTUM;
+  if (expired)
+    p->quantum_used = 0;
+  current_priority = effective_priority(p);
+  release(&p->lock);
+
+  if (expired)
+    return 1;
+  for (other = proc; other < &proc[NPROC]; other++) {
+    if (other == p)
+      continue;
+    acquire(&other->lock);
+    int preempt = other->state == RUNNABLE &&
+                  effective_priority(other) < current_priority;
+    release(&other->lock);
+    if (preempt)
+      return 1;
+  }
+  return 0;
+}
+
+static int
+mlfq_on_tick(struct proc *p)
+{
+  int level;
+  int expired = 0;
+  struct proc *other;
+
+  acquire(&p->lock);
+  level = p->mlfq_level;
+  if (++p->quantum_used >= mlfq_quantum[level]) {
+    if (p->mlfq_level < MLFQ_LEVELS - 1)
+      p->mlfq_level++;
+    p->quantum_used = 0;
+    expired = 1;
+  }
+  level = p->mlfq_level;
+  release(&p->lock);
+
+  if (expired)
+    return 1;
+  for (other = proc; other < &proc[NPROC]; other++) {
+    if (other == p)
+      continue;
+    acquire(&other->lock);
+    int preempt = other->state == RUNNABLE && other->mlfq_level < level;
+    release(&other->lock);
+    if (preempt)
+      return 1;
+  }
+  return 0;
+}
+
+static void
+common_on_wakeup(struct proc *p)
+{
+  p->quantum_used = 0;
+  p->aging_wait = 0;
+}
+
+void
+sched_on_wakeup(struct proc *p)
+{
+  active_policy->on_wakeup(p);
+}
+
+int
+sched_on_tick(struct proc *p)
+{
+  return active_policy->on_tick(p);
+}
+
+void
+sched_clock_tick(uint now)
+{
+  struct proc *p;
+  uint max_aging = SCHED_PRIORITY_MAX * PRIORITY_AGING_INTERVAL;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state == RUNNING)
+      p->run_time++;
+    else if (p->state == RUNNABLE) {
+      p->wait_time++;
+      if (p->aging_wait < max_aging)
+        p->aging_wait++;
+    }
+    release(&p->lock);
+  }
+
+  if (active_policy == &mlfq_policy && now - last_mlfq_boost >= MLFQ_BOOST_INTERVAL) {
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE || p->state == RUNNING || p->state == SLEEPING) {
+        p->mlfq_level = 0;
+        p->quantum_used = 0;
+        p->aging_wait = 0;
+      }
+      release(&p->lock);
+    }
+    last_mlfq_boost = now;
+  }
+}
+
+int
+kset_sched_policy(int policy)
+{
+  if (policy < SCHED_RR || policy > SCHED_MLFQ)
+    return -1;
+
+  if (policy == SCHED_RR)
+    active_policy = &rr_policy;
+  else if (policy == SCHED_PRIORITY)
+    active_policy = &priority_policy;
+  else
+    active_policy = &mlfq_policy;
+
+  last_mlfq_boost = ticks;
+  if (active_policy == &mlfq_policy) {
+    struct proc *p;
+    for (p = proc; p < &proc[NPROC]; p++) {
+      acquire(&p->lock);
+      p->mlfq_level = 0;
+      p->quantum_used = 0;
+      release(&p->lock);
+    }
+  }
+  return 0;
+}
+
+int
+kget_sched_policy(void)
+{
+  if (active_policy == &priority_policy)
+    return SCHED_PRIORITY;
+  if (active_policy == &mlfq_policy)
+    return SCHED_MLFQ;
+  return SCHED_RR;
+}
+
+int
+kset_priority(int priority)
+{
+  struct proc *p = myproc();
+  if (priority < 0 || priority > SCHED_PRIORITY_MAX)
+    return -1;
+  acquire(&p->lock);
+  p->priority = priority;
+  p->aging_wait = 0;
+  release(&p->lock);
+  return 0;
+}
+
+int
+kset_process_priority(int pid, int priority)
+{
+  struct proc *p;
+
+  if (pid <= 0 || priority < 0 || priority > SCHED_PRIORITY_MAX)
+    return -1;
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->pid == pid && p->state != UNUSED && p->state != ZOMBIE) {
+      p->priority = priority;
+      p->aging_wait = 0;
+      release(&p->lock);
+      return 0;
+    }
+    release(&p->lock);
+  }
+  return -1;
+}
+
 // Allocate a page for each process's kernel stack.
 // Map it high in memory, followed by an invalid
 // guard page.
@@ -124,6 +410,17 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->priority = SCHED_PRIORITY_MAX / 2;
+  p->mlfq_level = 0;
+  p->quantum_used = 0;
+  p->aging_wait = 0;
+  p->run_time = 0;
+  p->wait_time = 0;
+  p->context_switches = 0;
+  p->creation_time = ticks;
+  p->first_run_time = 0;
+  p->completion_time = 0;
+  p->started = 0;
 
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
@@ -167,6 +464,17 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  p->priority = 0;
+  p->mlfq_level = 0;
+  p->quantum_used = 0;
+  p->aging_wait = 0;
+  p->run_time = 0;
+  p->wait_time = 0;
+  p->context_switches = 0;
+  p->creation_time = 0;
+  p->first_run_time = 0;
+  p->completion_time = 0;
+  p->started = 0;
   p->state = UNUSED;
 }
 
@@ -225,7 +533,9 @@ userinit(void)
 
   p->cwd = namei("/");
 
+  p->creation_time = ticks;
   p->state = RUNNABLE;
+  sched_on_wakeup(p);
 
   release(&p->lock);
 }
@@ -288,6 +598,7 @@ kfork(void)
   np->cwd = idup(p->cwd);
 
   safestrcpy(np->name, p->name, sizeof(p->name));
+  np->priority = p->priority;
 
   pid = np->pid;
 
@@ -298,7 +609,9 @@ kfork(void)
   release(&wait_lock);
 
   acquire(&np->lock);
+  np->creation_time = ticks;
   np->state = RUNNABLE;
+  sched_on_wakeup(np);
   release(&np->lock);
 
   return pid;
@@ -355,6 +668,7 @@ kexit(int status)
   acquire(&p->lock);
 
   p->xstate = status;
+  p->completion_time = ticks;
   p->state = ZOMBIE;
 
   release(&wait_lock);
@@ -441,31 +755,34 @@ scheduler(void)
     intr_on();
     intr_off();
 
-    int found = 0;
-    for (p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if (p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Don't re-enable interrupts on release.
-        mycpu()->intena = 0;
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
-      }
-      release(&p->lock);
-    }
-    if (found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
+    p = active_policy->pick_next();
+    if (p == 0) {
+      // Nothing to run; stop running on this core until an interrupt.
       asm volatile("wfi");
+      continue;
     }
+
+    acquire(&p->lock);
+    if (p->state != RUNNABLE) {
+      release(&p->lock);
+      continue;
+    }
+
+    p->state = RUNNING;
+    p->context_switches++;
+    if (!p->started) {
+      p->started = 1;
+      p->first_run_time = ticks;
+    }
+    c->proc = p;
+    swtch(&c->context, &p->context);
+
+    // Don't re-enable interrupts on release.
+    mycpu()->intena = 0;
+
+    // The process changed its state before switching back.
+    c->proc = 0;
+    release(&p->lock);
   }
 }
 
@@ -566,6 +883,7 @@ sleep(void)
   acquire(&p->lock);
   if (p->chan != 0) {
     p->state = SLEEPING;
+    p->quantum_used = 0;
     sched();
   }
   release(&p->lock);
@@ -588,6 +906,7 @@ wakeup(void *chan)
       // go to sleep, also set it back to RUNNING.
       if (p->state == SLEEPING) {
         p->state = RUNNABLE;
+        sched_on_wakeup(p);
       }
     }
     release(&p->lock);
@@ -612,6 +931,7 @@ kkill(int pid)
       if (p->state == SLEEPING) {
         // Wake process from sleep().
         p->state = RUNNABLE;
+        sched_on_wakeup(p);
       }
       release(&p->lock);
       return 0;
